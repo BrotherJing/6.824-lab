@@ -131,7 +131,7 @@ func port(suffix string) string {
 
 func setup() *Master {
 	files := makeInputs(nMap)
-	master := port("master")
+	master := port("master")//socket name for master
 	mr := Distributed("test", files, nReduce, master)
 	return mr
 }
