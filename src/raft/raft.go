@@ -27,6 +27,11 @@ import "time"
 import "math/rand"
 //import "fmt"
 
+type LogEntry struct{
+	Term	int
+	Command	interface{}
+}
+
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -53,13 +58,15 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm	int
 	voteFor		int
-	//log		[]int
+
+	log			[]LogEntry
 	commitIndex	int
 	lastApplied	int
 	nextIndex	[]int
 	matchIndex	[]int
 
 	resetChan	chan int
+	role		int//0: follower, 1: candidate, 2: leader
 }
 
 // return currentTerm and whether this server
@@ -70,8 +77,11 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here.
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	term = rf.currentTerm
-	isleader = (rf.voteFor == rf.me)
+	//isleader = (rf.voteFor == rf.me)
+	isleader = (rf.role == 2)
 
 	return term, isleader
 }
@@ -135,7 +145,7 @@ type AppendEntriesArgs struct {
 	LeaderId		int
 	PrevLogIndex	int
 	PrevLogTerm		int
-	//entries			[]int
+	entries			[]LogEntry
 	LeaderCommit	int
 }
 
@@ -164,6 +174,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		if args.Term > rf.currentTerm{
 			rf.currentTerm = args.Term
 		}
+		rf.role = 0
 		rf.voteFor = args.CandidateId
 		go func(){
 			//fmt.Printf("Raft %v votes for Raft %v at term %v\n", rf.me, args.CandidateId, rf.currentTerm)
@@ -206,6 +217,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 			rf.currentTerm = args.Term
 		}
 		rf.voteFor = args.LeaderId
+		rf.role = 0
 		go func(){
 			//fmt.Printf("Raft %v receive heartbeat from Raft %v at term %v\n", rf.me, args.LeaderId, args.Term)
 			rf.resetChan <- args.LeaderId
@@ -236,6 +248,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
+	_, isLeader = rf.GetState()
+
+	if isLeader{
+		rf.mu.Lock()
+		index = len(rf.log) - 1
+		entry := LogEntry{}
+		entry.Term = rf.currentTerm
+		entry.Command = command
+		rf.log = append(rf.log, entry)
+		term = rf.currentTerm
+		rf.mu.Unlock()
+	}
+
+	//TODO: broadcast to followers
 
 	return index, term, isLeader
 }
@@ -271,10 +297,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here.
 	rf.currentTerm	= 0
 	rf.voteFor		= -1
-	//log		[]int
+	rf.log = make([]LogEntry, 1)
 	rf.commitIndex	= 0
 	rf.lastApplied	= 0
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+
 	rf.resetChan = make(chan int)
+	rf.role = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -284,17 +314,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		stale := false
 		grantChan := make(chan int)
 		for{
-			rf.mu.Lock()
 			_, isleader := rf.GetState()
-			rf.mu.Unlock()
 			//leader state
 			if isleader{
 				//fmt.Printf("Raft %v believes he is leader at term %v\n", rf.me, rf.currentTerm)
 				select{
 				case <- time.After(20 * time.Millisecond):
-					rf.mu.Lock()
 					_, isleader = rf.GetState()
-					rf.mu.Unlock()
 					if isleader{
 						for i := range rf.peers{
 							if i == rf.me{
@@ -313,6 +339,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 									if appendEntriesReply.Term > rf.currentTerm{
 										rf.currentTerm = appendEntriesReply.Term
 										rf.voteFor = -1
+										rf.role = 0
 									}
 									rf.mu.Unlock()
 								}
@@ -338,6 +365,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							//fmt.Printf("Raft %v becomes leader for term %v with %v votes\n", rf.me, rf.currentTerm, granted)
 							rf.mu.Lock()
 							rf.voteFor = rf.me
+							rf.role = 2
 							rf.mu.Unlock()
 
 							for i := range rf.peers{
@@ -356,6 +384,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										if appendEntriesReply.Term > rf.currentTerm{
 											rf.currentTerm = appendEntriesReply.Term
 											rf.voteFor = -1//failed the election
+											rf.role = 0
 										}
 										rf.mu.Unlock()
 									}
@@ -367,6 +396,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				case <- time.After(time.Duration(ms) * time.Millisecond):
 					//fmt.Printf("Raft %v timeout, %v millisecond\n", rf.me, ms)
 					rf.mu.Lock()
+					rf.role = 1
+					rf.voteFor = rf.me
 					rf.currentTerm += 1
 					granted = 1
 					stale = false
