@@ -148,6 +148,7 @@ func (cfg *config) start1(i int) {
 			if m.UseSnapshot {
 				// ignore the snapshot
 			} else if v, ok := (m.Command).(int); ok {
+				//fmt.Printf("Raft %v committed %v at index %v\n", i, v, m.Index)
 				cfg.mu.Lock()
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.Index]; oldok && old != v {
@@ -408,6 +409,7 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				//fmt.Printf("command %v, committed %v\n", cmd1.(int), nd)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
