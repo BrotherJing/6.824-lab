@@ -190,8 +190,9 @@ type AppendEntriesArgs struct {
 // AppendEntries RPC arguments structure.
 //
 type AppendEntriesReply struct {
-	Term	int
-	Success	bool
+	Term		int
+	Success		bool
+	NextIndex	int
 }
 
 //
@@ -260,8 +261,17 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm{
 		reply.Success = false
-	}else if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm{
+	}else if args.PrevLogIndex >= len(rf.log){
 		reply.Success = false
+		reply.NextIndex = len(rf.log)
+	}else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm{
+		reply.Success = false
+		for i := args.PrevLogIndex - 1 ; i >= 0; i-- {
+			if rf.log[i].Term != rf.log[args.PrevLogIndex].Term {
+				reply.NextIndex = i + 1
+				break
+			}
+		}
 	}else{
 		/*if rf.me==1{
 			fmt.Printf("Heartbeat from Raft %v: %v\n", args.LeaderId, args)
@@ -380,9 +390,8 @@ func (rf *Raft) sendAppendEntriesHelper(server int){
 				rf.role = 0
 				rf.persist()
 			}else{
-				//if rf.nextIndex[server] > 1{
-				rf.nextIndex[server] = appendEntriesArgs.PrevLogIndex					
-				//}
+				//rf.nextIndex[server] = appendEntriesArgs.PrevLogIndex					
+				rf.nextIndex[server] = appendEntriesReply.NextIndex
 				rf.mu.Unlock()
 				go rf.sendAppendEntriesHelper(server)
 				return
