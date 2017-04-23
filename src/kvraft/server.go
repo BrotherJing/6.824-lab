@@ -6,6 +6,7 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"fmt"
 )
 
 const Debug = 0
@@ -22,6 +23,9 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Op		string
+	Key		string
+	Value	string
 }
 
 type RaftKV struct {
@@ -33,15 +37,56 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	replyCh	map[int]chan Op
+	db		map[string]string
 }
 
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	cmd := Op{Op:"Get", Key:args.Key}
+	index, _, isLeader := kv.rf.Start(cmd)
+	if !isLeader{
+		reply.WrongLeader = true
+		reply.Err = "Not a leader."
+		return
+	}
+	fmt.Printf("%v\n", args)
+	reply.WrongLeader = false
+	ch, ok := kv.replyCh[index]
+	if !ok{
+		kv.replyCh[index] = make(chan Op)
+		ch = kv.replyCh[index]
+	}
+	cmdApplied := <- ch
+	if cmd != cmdApplied{
+		reply.Err = "Different command applied."
+		return
+	}
+	reply.Value = kv.db[args.Key]
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	cmd := Op{Op:args.Op, Key:args.Key, Value:args.Value}
+	index, _, isLeader := kv.rf.Start(cmd)
+	if !isLeader{
+		reply.WrongLeader = true
+		reply.Err = "Not a leader."
+		return
+	}
+	fmt.Printf("%v\n", args)
+	reply.WrongLeader = false
+	ch, ok := kv.replyCh[index]
+	if !ok{
+		kv.replyCh[index] = make(chan Op)
+		ch = kv.replyCh[index]
+	}
+	cmdApplied := <- ch
+	if cmd != cmdApplied{
+		reply.Err = "Different command applied."
+		return
+	}
 }
 
 //
@@ -78,10 +123,38 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// Your initialization code here.
+	kv.replyCh = make(map[int]chan Op)
+	kv.db = make(map[string]string)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	go func() {
+		for m := range kv.applyCh {
+			if m.UseSnapshot {
+				// ignore the snapshot
+			} else if v, ok := (m.Command).(Op); ok {
+				//fmt.Printf("Raft %v committed %v at index %v\n", i, v, m.Index)
+				kv.mu.Lock()
+				switch v.Op{
+				case "Get":
+				case "Put":
+					kv.db[v.Key] = v.Value
+				case "Append":
+					kv.db[v.Key] += v.Value
+				}
+				kv.mu.Unlock()
+				ch, ok := kv.replyCh[m.Index]
+				if !ok{
+					kv.replyCh[m.Index] = make(chan Op)
+					ch = kv.replyCh[m.Index]
+				}
+				go func(){
+					ch <- v
+				}()
+			}
+		}
+	}()
 
 	return kv
 }

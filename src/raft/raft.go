@@ -26,7 +26,7 @@ import "encoding/gob"
 import "time"
 import "math/rand"
 import "sort"
-//import "fmt"
+import "fmt"
 
 func min(a, b int) int {
 	if a > b{
@@ -431,7 +431,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		term = rf.currentTerm
 		rf.mu.Unlock()
-		//fmt.Printf("Raft %v starts agreement on Cmd %v at index %v at term %v\n", rf.me, command.(int), index, rf.currentTerm)
+		fmt.Printf("Raft %v starts agreement on Cmd %v at index %v at term %v\n", rf.me, command, index, rf.currentTerm)
 		//fmt.Printf("Leader %v, log %v\n", rf.me, rf.log)
 	}
 
