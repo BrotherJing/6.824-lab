@@ -7,6 +7,7 @@ import (
 	"raft"
 	"sync"
 	"fmt"
+	"time"
 )
 
 const Debug = 0
@@ -26,6 +27,8 @@ type Op struct {
 	Op		string
 	Key		string
 	Value	string
+	ReqId	int
+	Id		int64
 }
 
 type RaftKV struct {
@@ -39,12 +42,13 @@ type RaftKV struct {
 	// Your definitions here.
 	replyCh	map[int]chan Op
 	db		map[string]string
+	reqids	map[int64]int
 }
 
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	cmd := Op{Op:"Get", Key:args.Key}
+	cmd := Op{Op:"Get", Key:args.Key, Id:args.Id, ReqId:args.ReqId}
 	index, _, isLeader := kv.rf.Start(cmd)
 	if !isLeader{
 		reply.WrongLeader = true
@@ -58,17 +62,24 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		kv.replyCh[index] = make(chan Op)
 		ch = kv.replyCh[index]
 	}
-	cmdApplied := <- ch
-	if cmd != cmdApplied{
-		reply.Err = "Different command applied."
+	select{
+	case cmdApplied := <- ch:
+		if cmd != cmdApplied{
+			reply.Err = "a different request has appeared at the index returned by Start()"
+			return
+		}
+		kv.mu.Lock()
+		reply.Value = kv.db[args.Key]
+		kv.mu.Unlock()
+	case <- time.After(1000 * time.Millisecond):
+		reply.Err = "Timeout."
 		return
 	}
-	reply.Value = kv.db[args.Key]
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	cmd := Op{Op:args.Op, Key:args.Key, Value:args.Value}
+	cmd := Op{Op:args.Op, Key:args.Key, Value:args.Value, Id:args.Id, ReqId:args.ReqId}
 	index, _, isLeader := kv.rf.Start(cmd)
 	if !isLeader{
 		reply.WrongLeader = true
@@ -82,9 +93,14 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.replyCh[index] = make(chan Op)
 		ch = kv.replyCh[index]
 	}
-	cmdApplied := <- ch
-	if cmd != cmdApplied{
-		reply.Err = "Different command applied."
+	select{
+	case cmdApplied := <- ch:
+		if cmd != cmdApplied{
+			reply.Err = "a different request has appeared at the index returned by Start()"
+			return
+		}
+	case <- time.After(1000 * time.Millisecond):
+		reply.Err = "Timeout."
 		return
 	}
 }
@@ -125,6 +141,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// Your initialization code here.
 	kv.replyCh = make(map[int]chan Op)
 	kv.db = make(map[string]string)
+	kv.reqids = make(map[int64]int)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -136,22 +153,32 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			} else if v, ok := (m.Command).(Op); ok {
 				//fmt.Printf("Raft %v committed %v at index %v\n", i, v, m.Index)
 				kv.mu.Lock()
-				switch v.Op{
-				case "Get":
-				case "Put":
-					kv.db[v.Key] = v.Value
-				case "Append":
-					kv.db[v.Key] += v.Value
+				reqid, ok := kv.reqids[v.Id]
+				if ok && v.ReqId <= reqid{
+					//duplicated!
+				}else{
+					kv.reqids[v.Id] = v.ReqId
+					switch v.Op{
+					case "Get":
+					case "Put":
+						kv.db[v.Key] = v.Value
+					case "Append":
+						kv.db[v.Key] += v.Value
+					}
 				}
 				kv.mu.Unlock()
 				ch, ok := kv.replyCh[m.Index]
 				if !ok{
 					kv.replyCh[m.Index] = make(chan Op)
-					ch = kv.replyCh[m.Index]
+				}else{
+					select{
+					case <- ch:
+					default:
+					}
+					go func(){
+						ch <- v
+					}()
 				}
-				go func(){
-					ch <- v
-				}()
 			}
 		}
 	}()

@@ -431,7 +431,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		term = rf.currentTerm
 		rf.mu.Unlock()
-		fmt.Printf("Raft %v starts agreement on Cmd %v at index %v at term %v\n", rf.me, command, index, rf.currentTerm)
+		//fmt.Printf("Raft %v starts agreement on Cmd %v at index %v at term %v\n", rf.me, command, index, rf.currentTerm)
 		//fmt.Printf("Leader %v, log %v\n", rf.me, rf.log)
 	}
 
@@ -534,7 +534,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					if grantTerm == rf.currentTerm{
 						granted += 1
 						if !stale && granted >= (len(rf.peers)+1)/2{
-							//fmt.Printf("Raft %v becomes leader for term %v with %v votes\n", rf.me, rf.currentTerm, granted)
+							fmt.Printf("Raft %v becomes leader for term %v with %v votes\n", rf.me, rf.currentTerm, granted)
 							//rf.mu.Lock()
 							rf.voteFor = rf.me
 							rf.role = 2

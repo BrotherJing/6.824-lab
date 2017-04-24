@@ -3,13 +3,18 @@ package raftkv
 import "labrpc"
 import "crypto/rand"
 import "math/big"
+import "sync"
 
-//import "fmt"
+import "fmt"
 
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	lastLeader	int
+	id			int64
+	reqid		int
+	mu			sync.Mutex
 }
 
 func nrand() int64 {
@@ -23,6 +28,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.id = nrand()
+	ck.reqid = 0
 	return ck
 }
 
@@ -41,17 +48,36 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	args := GetArgs{Key: key}
+	args.Id = ck.id
+	ck.mu.Lock()
+	args.ReqId = ck.reqid
+	ck.reqid++
+	ck.mu.Unlock()
+	tryone := func (i int) (string, bool) {
+		reply := &GetReply{}
+		ok := ck.servers[i].Call("RaftKV.Get", &args, &reply)
+		if ok{
+			if reply.Err != ""{
+				if !reply.WrongLeader{
+					fmt.Printf("%v\n", reply.Err)
+				}
+			}else{
+				ck.lastLeader = i
+				return reply.Value, true
+			}
+		}else{
+			//fmt.Printf("%v dropped\n", args)
+		}
+		return "", false
+	}
+	if res, ok:=tryone(ck.lastLeader); ok{
+		return res
+	}
 	for{
 		for i := range ck.servers{
-			args := GetArgs{Key: key}
-			reply := &GetReply{}
-			ok := ck.servers[i].Call("RaftKV.Get", &args, &reply)
-			if ok{
-				if reply.Err != ""{
-					//fmt.Printf("%v\n", reply.Err)
-				}else{
-					return reply.Value
-				}
+			if res, ok:=tryone(i); ok{
+				return res
 			}
 		}
 	}
@@ -70,17 +96,36 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{Key: key, Value: value, Op: op}
+	args.Id = ck.id
+	ck.mu.Lock()
+	args.ReqId = ck.reqid
+	ck.reqid++
+	ck.mu.Unlock()
+	tryone := func (i int) bool{
+		reply := &PutAppendReply{}
+		ok := ck.servers[i].Call("RaftKV.PutAppend", &args, &reply)
+		if ok{
+			if reply.Err == ""{
+				ck.lastLeader = i
+				return true
+			}else{
+				if !reply.WrongLeader{
+					fmt.Printf("%v\n", reply.Err)
+				}
+			}
+		}else{
+			fmt.Printf("%v dropped\n", args)
+		}
+		return false
+	}
+	if tryone(ck.lastLeader){
+		return
+	}
 	for{
 		for i := range ck.servers{
-			args := PutAppendArgs{Key: key, Value: value, Op: op}
-			reply := &PutAppendReply{}
-			ok := ck.servers[i].Call("RaftKV.PutAppend", &args, &reply)
-			if ok{
-				if reply.Err == ""{
-					return
-				}else{
-					//fmt.Printf("%v\n", reply.Err)
-				}
+			if tryone(i){
+				return
 			}
 		}
 	}
