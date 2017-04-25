@@ -36,6 +36,7 @@ func min(a, b int) int {
 }
 
 type LogEntry struct{
+	Index	int
 	Term	int
 	Command	interface{}
 }
@@ -95,6 +96,14 @@ func (rf *Raft) GetState() (int, bool) {
 	isleader = (rf.role == 2)
 
 	return term, isleader
+}
+
+func (rf *Raft) GetLastLogTerm() int {
+	return rf.log[len(rf.log)-1].Term
+}
+
+func (rf *Raft) GetLastLogIndex() int {
+	return rf.log[len(rf.log)-1].Index
 }
 
 //
@@ -209,7 +218,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		//fmt.Printf("Raft %v refuses to vote for Raft %v, has vote for other\n", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 	}else if args.LastLogTerm < rf.log[len(rf.log)-1].Term ||
-		args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1{
+		args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < rf.GetLastLogIndex(){
 		//fmt.Printf("Raft %v refuses to vote for Raft %v due to stale log\n", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 	}else{
@@ -258,50 +267,29 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	baseIndex := rf.log[0].Index
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm{
 		reply.Success = false
-	}else if args.PrevLogIndex >= len(rf.log){
+	}else if args.PrevLogIndex > rf.GetLastLogIndex(){
 		reply.Success = false
-		reply.NextIndex = len(rf.log)
-	}else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm{
+		reply.NextIndex = rf.GetLastLogIndex()+1
+	}else if rf.log[args.PrevLogIndex-baseIndex].Term != args.PrevLogTerm{
 		reply.Success = false
-		for i := args.PrevLogIndex - 1 ; i >= 0; i-- {
-			if rf.log[i].Term != rf.log[args.PrevLogIndex].Term {
+		for i := args.PrevLogIndex - 1 ; i >= baseIndex; i-- {
+			if rf.log[i-baseIndex].Term != rf.log[args.PrevLogIndex-baseIndex].Term {
 				reply.NextIndex = i + 1
 				break
 			}
 		}
 	}else{
-		/*if rf.me==1{
-			fmt.Printf("Heartbeat from Raft %v: %v\n", args.LeaderId, args)
-			fmt.Printf("%v\n", rf.log)
-		}*/
-		for i, entry := range args.Entries{
-			if args.PrevLogIndex+1+i >= len(rf.log){
-				rf.log = append(rf.log, entry)
-			}else if logOld := rf.log[args.PrevLogIndex+1+i]; logOld.Term != entry.Term{
-				rf.log = append(rf.log[:args.PrevLogIndex+1+i], entry)
-			}
-		}
+		rf.log = rf.log[:args.PrevLogIndex-baseIndex+1]
+		rf.log = append(rf.log, args.Entries...)
 		if len(args.Entries) > 0{
 			rf.persist()
 		}
 		if args.LeaderCommit > rf.commitIndex{
-			//fmt.Printf("Raft %v, log %v\n", rf.me, rf.log)
-			//oldCommitIndex := rf.commitIndex
-			rf.commitIndex = min(args.LeaderCommit, len(rf.log) - 1)
-			/*go func(oldCommitIndex, commitIndex int){
-				for i:=oldCommitIndex+1; i<=commitIndex; i+=1{
-					rf.mu.Lock()
-					applyMsg := ApplyMsg{}
-					applyMsg.Index = i
-					applyMsg.Command = rf.log[i].Command
-					fmt.Printf("Raft %v, commit %v\n", rf.me, rf.commitIndex)
-					rf.mu.Unlock()
-					rf.applyCh <- applyMsg
-				}
-			}(oldCommitIndex, rf.commitIndex)*/
+			rf.commitIndex = min(args.LeaderCommit, rf.GetLastLogIndex())
 			go func(){
 				rf.commitCh <- 1
 			}()
@@ -331,6 +319,7 @@ func (rf *Raft) sendAppendEntriesHelper(server int){
 		return
 	}
 	rf.mu.Lock()
+	baseIndex := rf.log[0].Index
 	//fmt.Printf("Raft %v send haertbeat to Raft %v at term %v\n", rf.me, ii, rf.currentTerm)
 	appendEntriesArgs := AppendEntriesArgs{}
 	appendEntriesArgs.Term = rf.currentTerm
@@ -338,8 +327,8 @@ func (rf *Raft) sendAppendEntriesHelper(server int){
 	appendEntriesArgs.LeaderCommit = rf.commitIndex
 	appendEntriesArgs.PrevLogIndex = rf.nextIndex[server] - 1
 	//fmt.Printf("rf.nextIndex[%v]=%v\n", server, rf.nextIndex[server])
-	appendEntriesArgs.PrevLogTerm = rf.log[appendEntriesArgs.PrevLogIndex].Term
-	appendEntriesArgs.Entries = rf.log[rf.nextIndex[server]:]
+	appendEntriesArgs.PrevLogTerm = rf.log[appendEntriesArgs.PrevLogIndex-baseIndex].Term
+	appendEntriesArgs.Entries = rf.log[rf.nextIndex[server]-baseIndex:]
 	appendEntriesReply := &AppendEntriesReply{}
 	if len(appendEntriesArgs.Entries)>0{
 		//fmt.Printf("Raft %v sends to Raft %v, LeaderCommit=%v, PrevLogIndex=%v, PrevLogTerm=%v\n", rf.me, server,
@@ -423,8 +412,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	if isLeader{
 		rf.mu.Lock()
-		index = len(rf.log)
+		index = rf.log[len(rf.log) - 1].Index + 1
 		entry := LogEntry{}
+		entry.Index = index
 		entry.Term = rf.currentTerm
 		entry.Command = command
 		rf.log = append(rf.log, entry)
@@ -474,15 +464,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm	= 0
 	rf.voteFor		= -1
 	rf.log = make([]LogEntry, 1)
-	log0 := LogEntry{}
-	log0.Term = 0
-	log0.Command = 0
+	log0 := LogEntry{Index:0, Term:0, Command:0}
+	rf.log[0] = log0
 	rf.commitIndex	= 0
 	rf.lastApplied	= 0
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	for i := range rf.nextIndex{
-		rf.nextIndex[i] = len(rf.log)
+		//rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = rf.log[len(rf.log)-1].Index+1
 		rf.matchIndex[i] = 0
 	}
 
@@ -598,8 +588,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							request := RequestVoteArgs{}
 							request.Term = rf.currentTerm
 							request.CandidateId = rf.me
-							request.LastLogIndex = len(rf.log) - 1
-							request.LastLogTerm = rf.log[request.LastLogIndex].Term
+							//request.LastLogIndex = len(rf.log) - 1
+							//request.LastLogTerm = rf.log[request.LastLogIndex].Term
+							request.LastLogIndex = rf.GetLastLogIndex()
+							request.LastLogTerm = rf.GetLastLogTerm()
 							reply := &RequestVoteReply{}
 							rf.mu.Unlock()
 							if rf.sendRequestVote(ii, request, reply){
@@ -628,9 +620,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case <-rf.commitCh:
 				rf.mu.Lock()
 				commitIndex := rf.commitIndex
+				baseIndex := rf.log[0].Index
 				//fmt.Printf("Raft %v, commit %v\n", rf.me, rf.commitIndex)
 				for i := rf.lastApplied+1; i <= commitIndex; i++ {
-					msg := ApplyMsg{Index: i, Command: rf.log[i].Command}
+					msg := ApplyMsg{Index: i, Command: rf.log[i-baseIndex].Command}
 					//fmt.Printf("Raft %v, commit %v\n", rf.me, rf.log[i])
 					applyCh <- msg
 					rf.lastApplied = i
