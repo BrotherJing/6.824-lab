@@ -5,7 +5,7 @@ import "crypto/rand"
 import "math/big"
 import "sync"
 
-import "fmt"
+//import "fmt"
 
 
 type Clerk struct {
@@ -60,7 +60,7 @@ func (ck *Clerk) Get(key string) string {
 		if ok{
 			if reply.Err != ""{
 				if !reply.WrongLeader{
-					fmt.Printf("%v\n", reply.Err)
+					//fmt.Printf("%v\n", reply.Err)
 				}
 			}else{
 				ck.lastLeader = i
@@ -111,11 +111,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				return true
 			}else{
 				if !reply.WrongLeader{
-					fmt.Printf("%v\n", reply.Err)
+					//fmt.Printf("%v\n", reply.Err)
 				}
 			}
 		}else{
-			fmt.Printf("%v dropped\n", args)
+			//fmt.Printf("%v dropped\n", args)
 		}
 		return false
 	}

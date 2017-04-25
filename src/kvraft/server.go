@@ -6,8 +6,9 @@ import (
 	"log"
 	"raft"
 	"sync"
-	"fmt"
+	//"fmt"
 	"time"
+	"bytes"
 )
 
 const Debug = 0
@@ -55,7 +56,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = "Not a leader."
 		return
 	}
-	fmt.Printf("%v\n", args)
+	//fmt.Printf("%v\n", args)
 	reply.WrongLeader = false
 	ch, ok := kv.replyCh[index]
 	if !ok{
@@ -86,7 +87,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = "Not a leader."
 		return
 	}
-	fmt.Printf("%v\n", args)
+	//fmt.Printf("%v\n", args)
 	reply.WrongLeader = false
 	ch, ok := kv.replyCh[index]
 	if !ok{
@@ -150,6 +151,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for m := range kv.applyCh {
 			if m.UseSnapshot {
 				// ignore the snapshot
+				kv.mu.Lock()
+				var temp int
+				r := bytes.NewBuffer(m.Snapshot)
+				d := gob.NewDecoder(r)
+				d.Decode(&temp)
+				d.Decode(&temp)
+				kv.db = make(map[string]string)
+				kv.reqids = make(map[int64]int)
+				d.Decode(&kv.db)
+				d.Decode(&kv.reqids)
+				kv.mu.Unlock()
 			} else if v, ok := (m.Command).(Op); ok {
 				//fmt.Printf("Raft %v committed %v at index %v\n", i, v, m.Index)
 				kv.mu.Lock()
@@ -166,7 +178,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 						kv.db[v.Key] += v.Value
 					}
 				}
-				kv.mu.Unlock()
 				ch, ok := kv.replyCh[m.Index]
 				if !ok{
 					kv.replyCh[m.Index] = make(chan Op)
@@ -179,6 +190,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 						ch <- v
 					}()
 				}
+				if maxraftstate != -1 && kv.rf.GetPersistSize() > maxraftstate{
+					w := new(bytes.Buffer)
+					e := gob.NewEncoder(w)
+					e.Encode(kv.db)
+					e.Encode(kv.reqids)
+					data := w.Bytes()
+					go kv.rf.StartSnapshot(data, m.Index)
+				}
+				kv.mu.Unlock()
 			}
 		}
 	}()
