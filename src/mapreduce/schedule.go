@@ -1,6 +1,9 @@
 package mapreduce
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 //
 // schedule() starts and waits for all tasks in the given phase (mapPhase
@@ -30,5 +33,51 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	//
 	// Your code here (Part III, Part IV).
 	//
+	var mu sync.Mutex
+	nComplete := 0
+	var freeList = make(chan string, ntasks) // list of free workers
+	var taskList = make(chan int, ntasks)
+	var finish = make(chan bool, 1)
+	for i := 0; i < ntasks; i++ {
+		taskList <- i
+	}
+loop:
+	for {
+		var worker string
+		select {
+		case worker = <-registerChan:
+			freeList <- worker
+		case worker = <-freeList:
+			select {
+			case i := <-taskList:
+				go func(i int) {
+					args := new(DoTaskArgs)
+					args.JobName = jobName
+					args.Phase = phase
+					args.TaskNumber = i
+					args.NumOtherPhase = n_other
+					if phase == mapPhase {
+						args.File = mapFiles[i]
+					}
+					ok := call(worker, "Worker.DoTask", args, nil)
+					if !ok {
+						// push failed task back to task list
+						taskList <- i
+					} else {
+						mu.Lock()
+						nComplete++
+						if nComplete == ntasks {
+							finish <- true
+						}
+						mu.Unlock()
+						// release this worker
+						freeList <- worker
+					}
+				}(i)
+			case <-finish:
+				break loop
+			}
+		}
+	}
 	fmt.Printf("Schedule: %v done\n", phase)
 }
