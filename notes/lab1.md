@@ -35,6 +35,12 @@ for {
 }
 ```
 
+什么时候用锁，什么时候用cahnnel？
+
+- state -- sharing and locks
+- communication -- channels
+- waiting for events -- channels
+
 ### Task4 Handle failure
 
 Mutex, break for loop.
