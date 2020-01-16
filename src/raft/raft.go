@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"labrpc"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -83,8 +84,15 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	// channels
-	resetChan chan int
+	resetChan  chan int
+	commitCond *sync.Cond
+}
+
+func min(a, b int) int {
+	if a > b {
+		return b
+	}
+	return a
 }
 
 // return currentTerm and whether this server
@@ -218,13 +226,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		return
 	}
-	if args.PrevLogIndex > len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		return
 	}
+	reply.Success = true
 	rf.updateTerm(args.Term)
 	go func() {
 		rf.resetChan <- 0
 	}()
+	// append logs
+	if args.Entries != nil {
+		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		rf.commitCond.L.Lock()
+		rf.commitCond.Signal()
+		rf.commitCond.L.Unlock()
+	}
 }
 
 //
@@ -302,6 +321,10 @@ func (rf *Raft) sendRequestVoteToAll() {
 				// convert to leader
 				fmt.Printf("Become leader: server %v\n", rf.me)
 				rf.state = Leader
+				for i := range rf.peers {
+					rf.nextIndex[i] = len(rf.log)
+					rf.matchIndex[i] = 0
+				}
 				go func() {
 					for {
 						rf.sendHeartbeatToAll()
@@ -330,6 +353,7 @@ func (rf *Raft) sendHeartbeatToAll() {
 	args.LeaderId = rf.me
 	args.PrevLogIndex = len(rf.log) - 1
 	args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+	args.LeaderCommit = rf.commitIndex
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -375,8 +399,70 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	index = len(rf.log)
+	term = rf.currentTerm
+	isLeader = rf.state == Leader
+
+	if isLeader {
+		rf.log = append(rf.log, LogEntry{term, command})
+		// start agreement
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				rf.matchIndex[i] = len(rf.log) - 1
+				continue
+			}
+			args := &AppendEntriesArgs{}
+			args.Term = rf.currentTerm
+			args.LeaderId = rf.me
+			args.PrevLogIndex = rf.nextIndex[i] - 1
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+			args.Entries = rf.log[rf.nextIndex[i]:]
+			args.LeaderCommit = rf.commitIndex
+
+			requestTerm := rf.currentTerm // used to check out-dated response
+			rf.startHelper(i, requestTerm, args)
+		}
+	}
 
 	return index, term, isLeader
+}
+
+func (rf *Raft) startHelper(server int, requestTerm int, args *AppendEntriesArgs) {
+	go func() {
+		reply := &AppendEntriesReply{}
+		rf.sendAppendEntries(server, args, reply)
+		if requestTerm < rf.currentTerm { // out-dated response, ignore it
+			return
+		}
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		rf.updateTerm(reply.Term)
+
+		if reply.Success {
+			rf.nextIndex[server] = len(rf.log)
+			rf.matchIndex[server] = len(rf.log) - 1
+		} else {
+			rf.nextIndex[server]--
+			args.PrevLogIndex = rf.nextIndex[server] - 1
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+			args.Entries = rf.log[rf.nextIndex[server]:]
+			// retry
+			rf.startHelper(server, requestTerm, args)
+		}
+		temp := make([]int, len(rf.matchIndex))
+		copy(temp, rf.matchIndex)
+		sort.Ints(temp)
+		N := temp[len(temp)/2]
+		if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
+			rf.commitIndex = N
+			rf.commitCond.L.Lock()
+			rf.commitCond.Signal()
+			rf.commitCond.L.Unlock()
+		}
+	}()
 }
 
 //
@@ -412,6 +498,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]LogEntry, 1)
 	rf.log[0] = LogEntry{0, nil}
 	rf.resetChan = make(chan int)
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	m := &sync.Mutex{}
+	rf.commitCond = sync.NewCond(m)
 
 	go func() {
 		for {
@@ -426,6 +517,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				fmt.Printf("Start election: server %v\n", rf.me)
 				rf.sendRequestVoteToAll()
 			}
+		}
+	}()
+
+	go func() {
+		for {
+			rf.commitCond.L.Lock()
+			for rf.lastApplied >= rf.commitIndex {
+				rf.commitCond.Wait()
+			}
+			rf.mu.Lock()
+			msg := ApplyMsg{true, rf.log[rf.lastApplied+1].Command, rf.lastApplied + 1}
+			rf.lastApplied++
+			rf.mu.Unlock()
+
+			applyCh <- msg
+			fmt.Printf("server %v send apply msg at %v\n", rf.me, rf.lastApplied-1)
+			rf.commitCond.L.Unlock()
 		}
 	}()
 
