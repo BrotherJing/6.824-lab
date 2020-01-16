@@ -207,11 +207,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.LastLogTerm > lastLog.Term ||
 		args.LastLogTerm == lastLog.Term && args.LastLogIndex >= len(rf.log)-1 {
 		reply.VoteGranted = true
+		rf.votedFor = args.CandidateID
 		fmt.Printf("Vote for server %v by server %v\n", args.CandidateID, rf.me)
 		go func() {
 			rf.resetChan <- 0
 		}()
 	}
+	// fmt.Printf("No vote for server %v by server %v: candidate: {%v, %v}, me: {%v, %v}\n",
+	// 	args.CandidateID, rf.me, args.LastLogTerm, args.LastLogIndex, lastLog.Term, len(rf.log)-1)
 }
 
 //
@@ -235,14 +238,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.resetChan <- 0
 	}()
 	// append logs
-	if args.Entries != nil {
-		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	if args.Entries != nil && len(args.Entries) > 0 {
+		for i := range args.Entries {
+			index := args.PrevLogIndex + 1 + i
+			if index >= len(rf.log) || // new entries, append directly
+				args.Entries[i].Term != rf.log[index].Term { // same index with different term, delete existing entries
+				rf.log = append(rf.log[:args.PrevLogIndex+1+i], args.Entries[i:]...)
+				break
+			}
+		}
+		fmt.Printf("server %v log len %v = %v + %v\n", rf.me, len(rf.log), args.PrevLogIndex+1, len(args.Entries))
 	}
 	if args.LeaderCommit > rf.commitIndex {
+		oldCommiIndex := rf.commitIndex
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-		rf.commitCond.L.Lock()
-		rf.commitCond.Signal()
-		rf.commitCond.L.Unlock()
+		if rf.commitIndex != oldCommiIndex {
+			fmt.Printf("server %v commit index %v -> %v, leader commit %v, log len %v\n",
+				rf.me, oldCommiIndex, rf.commitIndex, args.LeaderCommit, len(rf.log))
+			go func() {
+				rf.commitCond.L.Lock()
+				rf.commitCond.Signal()
+				rf.commitCond.L.Unlock()
+			}()
+		}
 	}
 }
 
@@ -293,6 +311,7 @@ func (rf *Raft) sendRequestVoteToAll() {
 	args.Term = rf.currentTerm
 	args.CandidateID = rf.me
 	args.LastLogTerm = rf.log[len(rf.log)-1].Term
+	args.LastLogIndex = len(rf.log) - 1
 
 	voteTerm := rf.currentTerm // used to check out-dated response
 	votes := 1
@@ -407,6 +426,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.state == Leader
 
 	if isLeader {
+		fmt.Printf("start %v\n", command)
 		rf.log = append(rf.log, LogEntry{term, command})
 		// start agreement
 		for i := 0; i < len(rf.peers); i++ {
@@ -445,7 +465,9 @@ func (rf *Raft) startHelper(server int, requestTerm int, args *AppendEntriesArgs
 			rf.nextIndex[server] = len(rf.log)
 			rf.matchIndex[server] = len(rf.log) - 1
 		} else {
-			rf.nextIndex[server]--
+			if rf.nextIndex[server] > 1 {
+				rf.nextIndex[server]--
+			}
 			args.PrevLogIndex = rf.nextIndex[server] - 1
 			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 			args.Entries = rf.log[rf.nextIndex[server]:]
@@ -458,9 +480,11 @@ func (rf *Raft) startHelper(server int, requestTerm int, args *AppendEntriesArgs
 		N := temp[len(temp)/2]
 		if rf.log[N].Term == rf.currentTerm && N > rf.commitIndex {
 			rf.commitIndex = N
-			rf.commitCond.L.Lock()
-			rf.commitCond.Signal()
-			rf.commitCond.L.Unlock()
+			go func() {
+				rf.commitCond.L.Lock()
+				rf.commitCond.Signal()
+				rf.commitCond.L.Unlock()
+			}()
 		}
 	}()
 }
@@ -527,12 +551,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.commitCond.Wait()
 			}
 			rf.mu.Lock()
-			msg := ApplyMsg{true, rf.log[rf.lastApplied+1].Command, rf.lastApplied + 1}
+			index := rf.lastApplied + 1
+			if index >= len(rf.log) {
+				fmt.Printf("server %v try to send index %v, log len is %v\n", rf.me, index, len(rf.log))
+				// cond might signal many times. Need to check index.
+				// another solution is to only signal when commit index actually changed
+				rf.mu.Unlock()
+				rf.commitCond.L.Unlock()
+				continue
+			}
+			msg := ApplyMsg{true, rf.log[index].Command, index}
 			rf.lastApplied++
 			rf.mu.Unlock()
 
+			fmt.Printf("server %v send apply msg {%v: %v}\n", rf.me, index, rf.log[index].Command)
 			applyCh <- msg
-			fmt.Printf("server %v send apply msg at %v\n", rf.me, rf.lastApplied-1)
 			rf.commitCond.L.Unlock()
 		}
 	}()
