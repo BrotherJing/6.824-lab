@@ -255,14 +255,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		return
 	}
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		return
-	}
-	reply.Success = true
 	rf.updateTerm(args.Term)
 	go func() {
 		rf.resetChan <- 0
 	}()
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.FirstIndex = len(rf.log)
+		return
+	}
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		for i := args.PrevLogIndex; i >= 0; i-- {
+			if rf.log[i].Term != reply.ConflictTerm {
+				reply.FirstIndex = i + 1
+				break
+			}
+		}
+		return
+	}
+	reply.Success = true
 	// append logs
 	if args.Entries != nil && len(args.Entries) > 0 {
 		for i := range args.Entries {
@@ -361,7 +372,7 @@ func (rf *Raft) sendRequestVoteToAll() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
-			if voteTerm < rf.currentTerm { // out-dated response, ignore it
+			if voteTerm != rf.currentTerm { // out-dated response, ignore it
 				return
 			}
 			if rf.updateTerm(reply.Term) { // convert to follower
@@ -381,8 +392,7 @@ func (rf *Raft) sendRequestVoteToAll() {
 				}
 				go func() {
 					for {
-						rf.sendHeartbeatToAll()
-						if rf.state != Leader {
+						if !rf.sendHeartbeatToAll() {
 							return
 						}
 						time.Sleep(100 * time.Millisecond)
@@ -398,29 +408,29 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) sendHeartbeatToAll() {
+func (rf *Raft) sendHeartbeatToAll() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	args := &AppendEntriesArgs{}
-	args.Term = rf.currentTerm
-	args.LeaderId = rf.me
-	args.PrevLogIndex = len(rf.log) - 1
-	args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-	args.LeaderCommit = rf.commitIndex
+	if rf.state != Leader {
+		return false
+	}
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		go func(i int) {
-			reply := &AppendEntriesReply{}
-			rf.sendAppendEntries(i, args, reply)
-			rf.mu.Lock()
-			rf.updateTerm(reply.Term)
-			rf.mu.Unlock()
-		}(i)
+		args := &AppendEntriesArgs{}
+		args.Term = rf.currentTerm
+		args.LeaderId = rf.me
+		args.PrevLogIndex = len(rf.log) - 1
+		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		args.LeaderCommit = rf.commitIndex
+		requestTerm := rf.currentTerm
+
+		rf.startHelper(i, requestTerm, args)
 	}
+	return true
 }
 
 func (rf *Raft) updateTerm(term int) bool {
@@ -494,20 +504,23 @@ func (rf *Raft) startHelper(server int, requestTerm int, args *AppendEntriesArgs
 		if !ok {
 			return
 		}
-		if requestTerm < rf.currentTerm { // out-dated response, ignore it
-			return
-		}
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		rf.updateTerm(reply.Term)
+		if requestTerm != rf.currentTerm { // out-dated response, ignore it
+			return
+		}
+		if rf.updateTerm(reply.Term) {
+			return
+		}
 
 		if reply.Success {
-			rf.nextIndex[server] = len(rf.log)
-			rf.matchIndex[server] = len(rf.log) - 1
+			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+			rf.matchIndex[server] = rf.nextIndex[server] - 1
 		} else {
-			if rf.nextIndex[server] > 1 {
-				rf.nextIndex[server]--
-			}
+			rf.nextIndex[server] = reply.FirstIndex
+			// if rf.nextIndex[server] > 1 {
+			// 	rf.nextIndex[server]--
+			// }
 			args.PrevLogIndex = rf.nextIndex[server] - 1
 			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 			args.Entries = rf.log[rf.nextIndex[server]:]
