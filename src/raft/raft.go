@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
+	"labgob"
 	"labrpc"
 	"math/rand"
 	"sort"
@@ -122,6 +124,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -144,6 +153,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		fmt.Printf("error decoding\n")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 //
@@ -178,8 +201,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term         int
+	Success      bool
+	ConflictTerm int
+	FirstIndex   int
 }
 
 //
@@ -208,13 +233,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		args.LastLogTerm == lastLog.Term && args.LastLogIndex >= len(rf.log)-1 {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
+		rf.persist()
 		fmt.Printf("Vote for server %v by server %v\n", args.CandidateID, rf.me)
 		go func() {
 			rf.resetChan <- 0
 		}()
+		return
 	}
-	// fmt.Printf("No vote for server %v by server %v: candidate: {%v, %v}, me: {%v, %v}\n",
-	// 	args.CandidateID, rf.me, args.LastLogTerm, args.LastLogIndex, lastLog.Term, len(rf.log)-1)
+	fmt.Printf("No vote for server %v by server %v: candidate: {%v, %v}, me: {%v, %v}\n", args.CandidateID, rf.me, args.LastLogTerm, args.LastLogIndex, lastLog.Term, len(rf.log)-1)
 }
 
 //
@@ -244,6 +270,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if index >= len(rf.log) || // new entries, append directly
 				args.Entries[i].Term != rf.log[index].Term { // same index with different term, delete existing entries
 				rf.log = append(rf.log[:args.PrevLogIndex+1+i], args.Entries[i:]...)
+				rf.persist()
 				break
 			}
 		}
@@ -253,8 +280,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		oldCommiIndex := rf.commitIndex
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		if rf.commitIndex != oldCommiIndex {
-			fmt.Printf("server %v commit index %v -> %v, leader commit %v, log len %v\n",
-				rf.me, oldCommiIndex, rf.commitIndex, args.LeaderCommit, len(rf.log))
+			fmt.Printf("server %v commit index %v -> %v, leader commit %v, log len %v\n", rf.me, oldCommiIndex, rf.commitIndex, args.LeaderCommit, len(rf.log))
 			go func() {
 				rf.commitCond.L.Lock()
 				rf.commitCond.Signal()
@@ -302,10 +328,16 @@ func (rf *Raft) sendRequestVoteToAll() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if rf.state == Leader {
+		return
+	}
+	fmt.Printf("Start election: server %v\n", rf.me)
+
 	// convert to candidate state
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.state = Candidate
+	rf.persist()
 
 	args := &RequestVoteArgs{}
 	args.Term = rf.currentTerm
@@ -321,7 +353,10 @@ func (rf *Raft) sendRequestVoteToAll() {
 		}
 		go func(i int) {
 			reply := &RequestVoteReply{}
-			rf.sendRequestVote(i, args, reply)
+			ok := rf.sendRequestVote(i, args, reply)
+			if !ok {
+				return
+			}
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
@@ -393,6 +428,7 @@ func (rf *Raft) updateTerm(term int) bool {
 		rf.currentTerm = term
 		rf.votedFor = -1
 		rf.state = Follower
+		rf.persist()
 		return true
 	}
 	return false
@@ -428,6 +464,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		fmt.Printf("start %v\n", command)
 		rf.log = append(rf.log, LogEntry{term, command})
+		rf.persist()
 		// start agreement
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
@@ -453,7 +490,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) startHelper(server int, requestTerm int, args *AppendEntriesArgs) {
 	go func() {
 		reply := &AppendEntriesReply{}
-		rf.sendAppendEntries(server, args, reply)
+		ok := rf.sendAppendEntries(server, args, reply)
+		if !ok {
+			return
+		}
 		if requestTerm < rf.currentTerm { // out-dated response, ignore it
 			return
 		}
@@ -535,10 +575,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case <-rf.resetChan:
 				// continue
 			case <-time.After(time.Duration(electionTimeout) * time.Millisecond):
-				if rf.state == Leader {
-					continue
-				}
-				fmt.Printf("Start election: server %v\n", rf.me)
 				rf.sendRequestVoteToAll()
 			}
 		}
