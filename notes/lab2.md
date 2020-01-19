@@ -14,3 +14,11 @@ Mutex不可重入，不能写嵌套的Lock, Unlock。
 需要往 applyCh 发已经commit的log。因为会阻塞，所以需要一个单独的goroutine来发。因为需要保证顺序，
 所以只能有一个goroutine。官方推荐用sync.Cond。具体做法是，发apply的goroutine等待一个条件（lastApplied < commitIndex），
 更新commitIndex的线程发Signal唤醒它。
+
+### Part 2C
+
+Unreliable的case需要处理请求超时。labrpc已经封装了超时的处理，请求失败会返回false。调用方需要检查，如果false直接返回不执行后面的逻辑。
+
+Figure8Unreliable这个case需要做 accelerated log backtracking optimization，否则过不了。
+
+heartbeat的response处理逻辑和append entry一样。如果返回false也需要减nextIndex然后重发。
