@@ -17,11 +17,21 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type Type int
+
+const (
+	PutOp    Type = 0
+	AppendOp      = 1
+	GetOp         = 2
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	OpType Type
+	Key    string
+	Value  string
 }
 
 type KVServer struct {
@@ -33,15 +43,85 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	store		map[string]string
+	conds		map[int]*sync.Cond
+	terms	map[int]int
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := &Op{}
+	op.OpType = GetOp
+	op.Key = args.Key
+	index, term, ok := kv.rf.Start(op)
+	if !ok {
+		reply.WrongLeader = true
+		return
+	}
+	kv.mu.Lock()
+	kv.terms[index] = -1
+	m := &sync.Mutex{}
+	kv.conds[index] = sync.NewCond(m)
+	kv.mu.Unlock()
+
+	kv.conds[index].L.Lock()
+	for kv.terms[index] == -1 {
+		kv.conds[index].Wait()
+	}
+	kv.conds[index].L.Unlock()
+	
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	
+	kv.conds[index] = nil
+	// leader change after call rf.Start() but before commit
+	if term != kv.terms[index] {
+		reply.WrongLeader = true
+		return
+	}
+	if v, ok := kv.store[args.Key]; ok {
+		reply.Value = v
+	} else {
+		reply.Err = ErrNoKey
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := &Op{}
+	if args.Op == "Put" {
+		op.OpType = PutOp
+	} else {
+		op.OpType = AppendOp
+	}
+	op.Key = args.Key
+	op.Value = args.Value
+	index, term, ok := kv.rf.Start(op)
+	if !ok {
+		reply.WrongLeader = true
+		return
+	}
+	kv.mu.Lock()
+	kv.terms[index] = -1
+	m := &sync.Mutex{}
+	kv.conds[index] = sync.NewCond(m)
+	kv.mu.Unlock()
+
+	kv.conds[index].L.Lock()
+	for kv.terms[index] == -1 {
+		kv.conds[index].Wait()
+	}
+	kv.conds[index].L.Unlock()
+	
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	
+	kv.conds[index] = nil
+	// leader change after call rf.Start() but before commit
+	if term != kv.terms[index] {
+		reply.WrongLeader = true
+		return
+	}
 }
 
 //
@@ -79,11 +159,43 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.store = make(map[string]string)
+	kv.conds = make(map[int]*sync.Cond)
+	kv.terms = make(map[int]int)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	go func() {
+		for m := range kv.applyCh {
+			if m.CommandValid == false {
+				// ignored
+			} else if op, ok := (m.Command).(*Op); ok {
+				kv.mu.Lock()
+				switch op.OpType {
+				case AppendOp:
+					if v, ok := kv.store[op.Key]; ok {
+						kv.store[op.Key] = v + op.Value
+						break
+					}
+				case PutOp:
+					kv.store[op.Key] = op.Value
+					break
+				default:
+					break
+				}
+				term, _ := kv.rf.GetState()
+				kv.terms[m.CommandIndex] = term
+				kv.mu.Unlock()
+				if _, ok := kv.conds[m.CommandIndex]; ok {
+					kv.conds[m.CommandIndex].L.Lock()
+					kv.conds[m.CommandIndex].Signal()
+					kv.conds[m.CommandIndex].L.Unlock()
+				}
+			}
+		}
+	}()
 
 	return kv
 }
