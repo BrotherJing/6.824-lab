@@ -104,6 +104,9 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	term = rf.currentTerm
 	isleader = rf.state == Leader
 
@@ -596,7 +599,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go func() {
 		for {
 			rf.commitCond.L.Lock()
-			for rf.lastApplied >= rf.commitIndex {
+			for {
+				rf.mu.Lock()
+				cond := rf.lastApplied < rf.commitIndex
+				rf.mu.Unlock()
+				if cond {
+					break
+				}
 				rf.commitCond.Wait()
 			}
 			rf.mu.Lock()
