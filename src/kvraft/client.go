@@ -9,7 +9,9 @@ import (
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	lastServer	int
+	lastServer int
+	id         int64
+	seq        int
 }
 
 func nrand() int64 {
@@ -23,6 +25,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.id = nrand()
 	return ck
 }
 
@@ -42,6 +45,9 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	args := &GetArgs{}
 	args.Key = key
+	args.Id = ck.id
+	args.Seq = ck.seq
+	ck.seq++
 	server := ck.lastServer
 	for {
 		reply := &GetReply{}
@@ -75,6 +81,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
+	args.Id = ck.id
+	args.Seq = ck.seq
+	ck.seq++
 	server := ck.lastServer
 	for {
 		reply := &PutAppendReply{}

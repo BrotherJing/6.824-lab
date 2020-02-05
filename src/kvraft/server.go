@@ -32,6 +32,8 @@ type Op struct {
 	OpType Type
 	Key    string
 	Value  string
+	Id     int64
+	Seq    int
 }
 
 type KVServer struct {
@@ -43,14 +45,17 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	store		map[string]string
-	conds		map[int]*sync.Cond
-	terms	map[int]int
+	store   map[string]string
+	conds   map[int]*sync.Cond
+	terms   map[int]int
+	lastSeq map[int64]int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	op := &Op{}
+	op := Op{}
+	op.Id = args.Id
+	op.Seq = args.Seq
 	op.OpType = GetOp
 	op.Key = args.Key
 	index, term, ok := kv.rf.Start(op)
@@ -61,18 +66,25 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	kv.terms[index] = -1
 	m := &sync.Mutex{}
-	kv.conds[index] = sync.NewCond(m)
+	cond := sync.NewCond(m)
+	kv.conds[index] = cond
 	kv.mu.Unlock()
 
-	kv.conds[index].L.Lock()
-	for kv.terms[index] == -1 {
-		kv.conds[index].Wait()
+	cond.L.Lock()
+	for {
+		kv.mu.Lock()
+		t := kv.terms[index]
+		kv.mu.Unlock()
+		if t != -1 {
+			break
+		}
+		cond.Wait()
 	}
-	kv.conds[index].L.Unlock()
-	
+	cond.L.Unlock()
+
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	
+
 	kv.conds[index] = nil
 	// leader change after call rf.Start() but before commit
 	if term != kv.terms[index] {
@@ -88,7 +100,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	op := &Op{}
+	op := Op{}
+	op.Id = args.Id
+	op.Seq = args.Seq
 	if args.Op == "Put" {
 		op.OpType = PutOp
 	} else {
@@ -104,18 +118,25 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	kv.terms[index] = -1
 	m := &sync.Mutex{}
-	kv.conds[index] = sync.NewCond(m)
+	cond := sync.NewCond(m)
+	kv.conds[index] = cond
 	kv.mu.Unlock()
 
-	kv.conds[index].L.Lock()
-	for kv.terms[index] == -1 {
-		kv.conds[index].Wait()
+	cond.L.Lock()
+	for {
+		kv.mu.Lock()
+		t := kv.terms[index]
+		kv.mu.Unlock()
+		if t != -1 {
+			break
+		}
+		cond.Wait()
 	}
-	kv.conds[index].L.Unlock()
-	
+	cond.L.Unlock()
+
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	
+
 	kv.conds[index] = nil
 	// leader change after call rf.Start() but before commit
 	if term != kv.terms[index] {
@@ -162,6 +183,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.store = make(map[string]string)
 	kv.conds = make(map[int]*sync.Cond)
 	kv.terms = make(map[int]int)
+	kv.lastSeq = make(map[int64]int)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -171,28 +193,40 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for m := range kv.applyCh {
 			if m.CommandValid == false {
 				// ignored
-			} else if op, ok := (m.Command).(*Op); ok {
+			} else if op, ok := (m.Command).(Op); ok {
 				kv.mu.Lock()
-				switch op.OpType {
-				case AppendOp:
-					if v, ok := kv.store[op.Key]; ok {
-						kv.store[op.Key] = v + op.Value
+				duplicated := false
+				if seq, ok := kv.lastSeq[op.Id]; ok {
+					duplicated = op.Seq <= seq
+				}
+				// fmt.Printf("server %v commit %v\n", kv.me, op.Value)
+				if !duplicated {
+					kv.lastSeq[op.Id] = op.Seq
+					switch op.OpType {
+					case AppendOp:
+						if v, ok := kv.store[op.Key]; ok {
+							kv.store[op.Key] = v + op.Value
+							break
+						}
+					case PutOp:
+						kv.store[op.Key] = op.Value
+						break
+					default:
 						break
 					}
-				case PutOp:
-					kv.store[op.Key] = op.Value
-					break
-				default:
-					break
 				}
-				term, _ := kv.rf.GetState()
-				kv.terms[m.CommandIndex] = term
 				kv.mu.Unlock()
-				if _, ok := kv.conds[m.CommandIndex]; ok {
-					kv.conds[m.CommandIndex].L.Lock()
-					kv.conds[m.CommandIndex].Signal()
-					kv.conds[m.CommandIndex].L.Unlock()
-				}
+				go func(cmdIndex int) {
+					term, _ := kv.rf.GetState()
+					kv.mu.Lock()
+					defer kv.mu.Unlock()
+					kv.terms[cmdIndex] = term
+					if cond, ok := kv.conds[cmdIndex]; ok {
+						cond.L.Lock()
+						cond.Signal()
+						cond.L.Unlock()
+					}
+				}(m.CommandIndex)
 			}
 		}
 	}()
