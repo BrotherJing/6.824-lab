@@ -6,6 +6,7 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"time"
 )
 
 const Debug = 0
@@ -46,8 +47,7 @@ type KVServer struct {
 
 	// Your definitions here.
 	store   map[string]string
-	conds   map[int]*sync.Cond
-	terms   map[int]int
+	replyCh map[int]chan int
 	lastSeq map[int64]int
 }
 
@@ -64,33 +64,27 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	kv.mu.Lock()
-	kv.terms[index] = -1
-	m := &sync.Mutex{}
-	cond := sync.NewCond(m)
-	kv.conds[index] = cond
+	ch, ok := kv.replyCh[index]
+	if !ok {
+		kv.replyCh[index] = make(chan int)
+		ch = kv.replyCh[index]
+	}
 	kv.mu.Unlock()
 
-	cond.L.Lock()
-	for {
-		kv.mu.Lock()
-		t := kv.terms[index]
-		kv.mu.Unlock()
-		if t != -1 {
-			break
+	select {
+	case currTerm := <-ch:
+		// leader change after call rf.Start() but before commit
+		if term != currTerm {
+			reply.WrongLeader = true
+			return
 		}
-		cond.Wait()
+	case <-time.After(1000 * time.Millisecond):
+		reply.WrongLeader = true // just to tell client to retry
+		return
 	}
-	cond.L.Unlock()
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
-	kv.conds[index] = nil
-	// leader change after call rf.Start() but before commit
-	if term != kv.terms[index] {
-		reply.WrongLeader = true
-		return
-	}
 	if v, ok := kv.store[args.Key]; ok {
 		reply.Value = v
 	} else {
@@ -116,31 +110,22 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	kv.mu.Lock()
-	kv.terms[index] = -1
-	m := &sync.Mutex{}
-	cond := sync.NewCond(m)
-	kv.conds[index] = cond
+	ch, ok := kv.replyCh[index]
+	if !ok {
+		kv.replyCh[index] = make(chan int)
+		ch = kv.replyCh[index]
+	}
 	kv.mu.Unlock()
 
-	cond.L.Lock()
-	for {
-		kv.mu.Lock()
-		t := kv.terms[index]
-		kv.mu.Unlock()
-		if t != -1 {
-			break
+	select {
+	case currTerm := <-ch:
+		// leader change after call rf.Start() but before commit
+		if term != currTerm {
+			reply.WrongLeader = true
+			return
 		}
-		cond.Wait()
-	}
-	cond.L.Unlock()
-
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	kv.conds[index] = nil
-	// leader change after call rf.Start() but before commit
-	if term != kv.terms[index] {
-		reply.WrongLeader = true
+	case <-time.After(1000 * time.Millisecond):
+		reply.WrongLeader = true // just to tell client to retry
 		return
 	}
 }
@@ -181,8 +166,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.store = make(map[string]string)
-	kv.conds = make(map[int]*sync.Cond)
-	kv.terms = make(map[int]int)
+	kv.replyCh = make(map[int]chan int)
 	kv.lastSeq = make(map[int64]int)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -215,18 +199,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 						break
 					}
 				}
+				ch, ok := kv.replyCh[m.CommandIndex]
+				if ok {
+					go func() {
+						term, _ := kv.rf.GetState()
+						ch <- term
+					}()
+				}
 				kv.mu.Unlock()
-				go func(cmdIndex int) {
-					term, _ := kv.rf.GetState()
-					kv.mu.Lock()
-					defer kv.mu.Unlock()
-					kv.terms[cmdIndex] = term
-					if cond, ok := kv.conds[cmdIndex]; ok {
-						cond.L.Lock()
-						cond.Signal()
-						cond.L.Unlock()
-					}
-				}(m.CommandIndex)
 			}
 		}
 	}()
