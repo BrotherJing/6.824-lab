@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -175,7 +176,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	go func() {
 		for m := range kv.applyCh {
-			if m.CommandValid == false {
+			if m.UseSnapshot {
+				kv.mu.Lock()
+				r := bytes.NewBuffer(m.Snapshot)
+				d := labgob.NewDecoder(r)
+				kv.store = make(map[string]string)
+				kv.lastSeq = make(map[int64]int)
+				d.Decode(&kv.store)
+				d.Decode(&kv.lastSeq)
+				kv.mu.Unlock()
+			} else if m.CommandValid == false {
 				// ignored
 			} else if op, ok := (m.Command).(Op); ok {
 				kv.mu.Lock()
@@ -205,6 +215,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 						term, _ := kv.rf.GetState()
 						ch <- term
 					}()
+				}
+				if maxraftstate != -1 && persister.RaftStateSize() > maxraftstate {
+					w := new(bytes.Buffer)
+					e := labgob.NewEncoder(w)
+					e.Encode(kv.store)
+					e.Encode(kv.lastSeq)
+					data := w.Bytes()
+					go kv.rf.StartSnapshot(data, m.CommandIndex)
 				}
 				kv.mu.Unlock()
 			}
